@@ -1,2 +1,604 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// Pin definitions
+#define TOUCH_SENSOR_PIN 32     // TTP223 dokunmatik sensör
+#define BUZZER_PIN 25           // Buzzer
+#define RED_LED_PIN 12          // KY-016 LED red
+#define GREEN_LED_PIN 13        // KY-016 LED green
+#define BLUE_LED_PIN 14         // KY-016 LED blue
+#define TEMP_SENSOR_PIN 33      // LM35 temperature sensor
+
+// OLED display settings (opsiyonel - eğer kullanıyorsanız)
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// WiFi settings
+const char* ssid = "B";
+const char* password = "12345678";
+
+WebServer server(80);
+
+// System status variables
+bool systemActive = true;
+bool touchDetected = false;
+bool highTempDetected = false;
+unsigned long lastTouchAlert = 0;
+unsigned long lastTempAlert = 0;
+unsigned long lastLEDChange = 0;
+bool ledState = false;
+int ledColor = 0; // 0: green, 1: red, 2: blue
+
+// Data history for graphing
+const int historySize = 50;
+float tempHistory[historySize];
+bool touchHistory[historySize];
+int historyIndex = 0;
+
+// Function prototypes
+void handleRoot();
+void handleData();
+void handleGraphData();
+void updateDisplay(float temperature);
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Set pin modes
+  pinMode(TOUCH_SENSOR_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RED_LED_PIN, OUTPUT);
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  pinMode(BLUE_LED_PIN, OUTPUT);
+  
+  // Initial LED state (green)
+  digitalWrite(GREEN_LED_PIN, HIGH);
+  digitalWrite(RED_LED_PIN, LOW);
+  digitalWrite(BLUE_LED_PIN, LOW);
+  
+  // Initialize OLED display (opsiyonel)
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+  } else {
+    display.display();
+    delay(2000);
+    display.clearDisplay();
+  }
+  
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.print("Connected to ");
+  Serial.println(ssid);
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  
+  // Web server routes
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/graphdata", handleGraphData);
+  server.on("/activate", []() {
+    systemActive = true;
+    server.send(200, "text/plain", "System activated");
+  });
+  server.on("/deactivate", []() {
+    systemActive = false;
+    // Turn off all alarms when deactivating
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    digitalWrite(BLUE_LED_PIN, LOW);
+    server.send(200, "text/plain", "System deactivated");
+  });
+  
+  server.begin();
+  Serial.println("HTTP server started");
+  
+  // Initial message on OLED (opsiyonel)
+  if(display.height() > 0) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(0,0);
+    display.println("Akilli Alarm");
+    display.println("Sistemi");
+    display.println("");
+    display.print("IP: ");
+    display.println(WiFi.localIP());
+    display.display();
+  }
+
+  // Initialize history arrays
+  for(int i=0; i<historySize; i++) {
+    tempHistory[i] = 0;
+    touchHistory[i] = false;
+  }
+}
+
+void loop() {
+  server.handleClient();
+  
+  if (!systemActive) {
+    return; // Skip other operations if system is inactive
+  }
+  
+  // Read sensor values
+  touchDetected = digitalRead(TOUCH_SENSOR_PIN) == HIGH; // HIGH when touched
+  
+  // Temperature reading (LM35)
+  int tempValue = analogRead(TEMP_SENSOR_PIN);
+  float temperature = (tempValue * 3.3 / 4095.0) * 100; // LM35: 10mV/°C, ESP32 ADC 3.3V ref
+  
+  highTempDetected = temperature > 35.0;
+  
+  // Store data for graphing
+  tempHistory[historyIndex] = temperature;
+  touchHistory[historyIndex] = touchDetected;
+  historyIndex = (historyIndex + 1) % historySize;
+  
+  // Check alarm states
+  bool anyAlarm = touchDetected || highTempDetected;
+  
+  // Buzzer and LED control
+  unsigned long currentMillis = millis();
+  
+  if (anyAlarm) {
+    // Sound buzzer with 1 second intervals
+    if (currentMillis - lastTouchAlert >= 1000) {
+      lastTouchAlert = currentMillis;
+      digitalWrite(BUZZER_PIN, !digitalRead(BUZZER_PIN));
+    }
+    
+    // Change LEDs every 1 second (red-blue)
+    if (currentMillis - lastLEDChange >= 1000) {
+      lastLEDChange = currentMillis;
+      ledState = !ledState;
+      
+      if (ledState) {
+        // Red on
+        digitalWrite(RED_LED_PIN, HIGH);
+        digitalWrite(GREEN_LED_PIN, LOW);
+        digitalWrite(BLUE_LED_PIN, LOW);
+      } else {
+        // Blue on
+        digitalWrite(RED_LED_PIN, LOW);
+        digitalWrite(GREEN_LED_PIN, LOW);
+        digitalWrite(BLUE_LED_PIN, HIGH);
+      }
+    }
+  } else {
+    // No alarm - turn off buzzer and set LED to green
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    digitalWrite(BLUE_LED_PIN, LOW);
+  }
+  
+  // Update OLED display (opsiyonel)
+  if(display.height() > 0) {
+    updateDisplay(temperature);
+  }
+  
+  delay(100); // Small delay
+}
+
+void updateDisplay(float temperature) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0,0);
+  
+  display.print("Sicaklik: ");
+  display.print(temperature, 1);
+  display.println(" C");
+  
+  display.print("Dokunma: ");
+  display.println(touchDetected ? "ALGILANDI" : "YOK");
+  
+  display.print("Sistem: ");
+  display.println(systemActive ? "AKTIF" : "PASIF");
+  
+  display.display();
+}
+
+void handleRoot() {
+  String html = R"=====(
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>ESP32 Akıllı Alarm Sistemi</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+      body { 
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+        margin: 0; 
+        padding: 20px; 
+        background-color: #f0f2f5; 
+        color: #333;
+      }
+      .container { 
+        max-width: 1000px; 
+        margin: 0 auto; 
+        background: white; 
+        padding: 25px; 
+        border-radius: 12px; 
+        box-shadow: 0 4px 12px rgba(0,0,0,0.1); 
+      }
+      h1 { 
+        color: #2c3e50; 
+        text-align: center; 
+        margin-bottom: 25px;
+        font-size: 28px;
+      }
+      .sensor-container {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 15px;
+        margin-bottom: 25px;
+      }
+      .sensor-box { 
+        background: linear-gradient(135deg, #f5f7fa 0%, #e4e8eb 100%);
+        padding: 15px; 
+        border-radius: 10px; 
+        text-align: center; 
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+        transition: transform 0.3s;
+      }
+      .sensor-box:hover {
+        transform: translateY(-5px);
+      }
+      .sensor-box h3 {
+        margin-top: 0;
+        color: #3498db;
+        font-size: 16px;
+      }
+      .sensor-value { 
+        font-size: 24px; 
+        font-weight: bold; 
+        color: #2c3e50;
+        margin: 8px 0;
+      }
+      .status-container {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 25px;
+      }
+      .alarm-status { 
+        padding: 15px; 
+        margin: 0;
+        border-radius: 10px; 
+        text-align: center; 
+        font-weight: bold;
+        font-size: 16px;
+        flex-grow: 1;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+      }
+      .alarm-active { 
+        background: linear-gradient(135deg, #ff5e62 0%, #ff2400 100%);
+        color: white; 
+        animation: pulse 1.5s infinite;
+      }
+      .alarm-inactive { 
+        background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        color: white; 
+      }
+      .system-status {
+        background: linear-gradient(135deg, #a1c4fd 0%, #c2e9fb 100%);
+        color: #2c3e50;
+        margin-left: 15px;
+        padding: 15px;
+        border-radius: 10px;
+        text-align: center;
+        font-weight: bold;
+        font-size: 16px;
+        min-width: 180px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+      }
+      .buttons { 
+        display: flex; 
+        justify-content: center; 
+        gap: 15px; 
+        margin: 20px 0; 
+      }
+      button { 
+        padding: 10px 20px; 
+        border: none; 
+        border-radius: 8px; 
+        cursor: pointer; 
+        font-size: 14px; 
+        font-weight: bold;
+        transition: all 0.3s;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+      }
+      button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+      }
+      .activate-btn { 
+        background: linear-gradient(135deg, #2ecc71 0%, #27ae60 100%);
+        color: white; 
+      }
+      .deactivate-btn { 
+        background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
+        color: white; 
+      }
+      .chart-container { 
+        margin-top: 25px; 
+        height: 300px; 
+        background: white;
+        padding: 15px;
+        border-radius: 10px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+      }
+      .chart-box {
+        margin-bottom: 25px;
+      }
+      .info-box {
+        background: #f8f9fa;
+        padding: 15px;
+        border-radius: 8px;
+        margin-top: 20px;
+        border-left: 4px solid #3498db;
+      }
+      @keyframes pulse {
+        0% { transform: scale(1); }
+        50% { transform: scale(1.02); }
+        100% { transform: scale(1); }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>🏠 Akıllı Ev Güvenlik Sistemi</h1>
+      
+      <div class="sensor-container">
+        <div class="sensor-box">
+          <h3>🌡 Sıcaklık</h3>
+          <div class="sensor-value" id="temp-value">0</div>
+          <div id="temp-status">Normal</div>
+        </div>
+        <div class="sensor-box">
+          <h3>👆 Dokunma Sensörü</h3>
+          <div class="sensor-value" id="touch-value">YOK</div>
+          <div id="touch-status">Normal</div>
+        </div>
+      </div>
+      
+      <div class="status-container">
+        <div id="alarm-status" class="alarm-status alarm-inactive">
+          SİSTEM NORMAL
+        </div>
+        <div class="system-status">
+          <div id="system-mode">AKTİF</div>
+          <div id="last-update">Son Güncelleme: <span id="update-time">-</span></div>
+        </div>
+      </div>
+      
+      <div class="buttons">
+        <button class="activate-btn" onclick="activateSystem()">✅ SİSTEMİ AKTİF ET</button>
+        <button class="deactivate-btn" onclick="deactivateSystem()">⛔ SİSTEMİ DURDUR</button>
+      </div>
+      
+      <div class="chart-box">
+        <div class="chart-container">
+          <canvas id="tempChart"></canvas>
+        </div>
+        <div class="chart-container">
+          <canvas id="touchChart"></canvas>
+        </div>
+      </div>
+      
+      <div class="info-box">
+        <h3>📊 Sistem Bilgileri</h3>
+        <p>Sıcaklık: <span id="temp-desc">Normal aralıkta</span></p>
+        <p>Dokunma algılama: <span id="touch-desc">Dokunma yok</span></p>
+        <p>Sistem durumu: <span id="system-desc">Gerçek zamanlı izleme</span></p>
+      </div>
+    </div>
+    
+    <script>
+      // Initialize charts
+      const tempCtx = document.getElementById('tempChart').getContext('2d');
+      const touchCtx = document.getElementById('touchChart').getContext('2d');
+      
+      const tempChart = new Chart(tempCtx, {
+        type: 'line',
+        data: {
+          labels: Array(50).fill(''),
+          datasets: [{
+            label: 'Sıcaklık (°C)',
+            data: Array(50).fill(0),
+            borderColor: 'rgba(255, 99, 132, 1)',
+            backgroundColor: 'rgba(255, 99, 132, 0.2)',
+            borderWidth: 1,
+            tension: 0.1
+          }]
+        },
+        options: {
+          responsive: true,
+          scales: {
+            y: {
+              beginAtZero: false
+            }
+          }
+        }
+      });
+      
+      const touchChart = new Chart(touchCtx, {
+        type: 'line',
+        data: {
+          labels: Array(50).fill(''),
+          datasets: [{
+            label: 'Dokunma Durumu (1=Algılandı)',
+            data: Array(50).fill(0),
+            borderColor: 'rgba(75, 192, 192, 1)',
+            backgroundColor: 'rgba(75, 192, 192, 0.2)',
+            borderWidth: 1,
+            tension: 0.1
+          }]
+        },
+        options: {
+          responsive: true,
+          scales: {
+            y: {
+              min: 0,
+              max: 1,
+              ticks: {
+                stepSize: 1
+              }
+            }
+          }
+        }
+      });
+      
+      function updateTime() {
+        const now = new Date();
+        document.getElementById('update-time').textContent = 
+          now.toLocaleTimeString() + ' ' + now.toLocaleDateString();
+      }
+      
+      function fetchData() {
+        fetch('/data')
+          .then(response => response.json())
+          .then(data => {
+            document.getElementById('temp-value').textContent = data.temperature.toFixed(1);
+            document.getElementById('touch-value').textContent = data.touch ? "ALGILANDI" : "YOK";
+            
+            // Temperature status
+            const tempStatus = document.getElementById('temp-status');
+            if(data.temperature > 35.0) {
+              tempStatus.textContent = 'YÜKSEK!';
+              tempStatus.style.color = '#e74c3c';
+              document.getElementById('temp-desc').textContent = 'Yüksek sıcaklık!';
+            } else {
+              tempStatus.textContent = 'NORMAL';
+              tempStatus.style.color = '#2ecc71';
+              document.getElementById('temp-desc').textContent = 'Normal aralıkta';
+            }
+            
+            // Touch status
+            const touchStatus = document.getElementById('touch-status');
+            if(data.touch) {
+              touchStatus.textContent = 'ALARM!';
+              touchStatus.style.color = '#e74c3c';
+              document.getElementById('touch-desc').textContent = 'Dokunma algılandı!';
+            } else {
+              touchStatus.textContent = 'NORMAL';
+              touchStatus.style.color = '#2ecc71';
+              document.getElementById('touch-desc').textContent = 'Dokunma yok';
+            }
+            
+            // Alarm status
+            const alarmDiv = document.getElementById('alarm-status');
+            if(data.alarm) {
+              alarmDiv.className = 'alarm-status alarm-active';
+              let alarmText = '🚨 ';
+              if(data.touch) alarmText += 'DOKUNMA ';
+              if(data.temperature > 35.0) alarmText += 'SICAKLIK ';
+              alarmText += 'ALARM!';
+              alarmDiv.innerHTML = alarmText;
+              document.getElementById('system-desc').textContent = 'Acil durum modu aktif';
+            } else {
+              alarmDiv.className = 'alarm-status alarm-inactive';
+              alarmDiv.innerHTML = '✅ SİSTEM NORMAL';
+              document.getElementById('system-desc').textContent = 'Gerçek zamanlı izleme';
+            }
+            
+            // System status
+            const systemMode = document.getElementById('system-mode');
+            if(!data.active) {
+              systemMode.textContent = 'PASİF';
+              systemMode.style.color = '#e74c3c';
+              alarmDiv.className = 'alarm-status';
+              alarmDiv.textContent = 'SİSTEM DURDURULDU';
+              document.getElementById('system-desc').textContent = 'Sistem manuel olarak durduruldu';
+            } else {
+              systemMode.textContent = 'AKTİF';
+              systemMode.style.color = '#2ecc71';
+            }
+            
+            updateTime();
+          });
+          
+        // Fetch graph data
+        fetchGraphData();
+      }
+      
+      function fetchGraphData() {
+        fetch('/graphdata')
+          .then(response => response.json())
+          .then(data => {
+            // Update temperature chart
+            tempChart.data.datasets[0].data = data.tempHistory;
+            tempChart.update();
+            
+            // Update touch chart (convert boolean to 1/0)
+            const touchData = data.touchHistory.map(val => val ? 1 : 0);
+            touchChart.data.datasets[0].data = touchData;
+            touchChart.update();
+          });
+      }
+      
+      function activateSystem() {
+        fetch('/activate')
+          .then(() => {
+            fetchData();
+          });
+      }
+      
+      function deactivateSystem() {
+        fetch('/deactivate')
+          .then(() => {
+            fetchData();
+          });
+      }
+      
+      // Update data every 1.5 seconds
+      setInterval(fetchData, 1500);
+      fetchData(); // Get initial data
+      updateTime(); // Update time initially
+    </script>
+  </body>
+</html>
+)=====";
+  server.send(200, "text/html", html);
+}
+
+void handleData() {
+  String data = "{";
+  data += "\"temperature\":" + String((analogRead(TEMP_SENSOR_PIN) * 3.3 / 4095.0) * 100, 1);
+  data += ",\"touch\":" + String(touchDetected ? "true" : "false");
+  data += ",\"alarm\":" + String((touchDetected || highTempDetected) ? "true" : "false");
+  data += ",\"active\":" + String(systemActive ? "true" : "false");
+  data += "}";
+  
+  server.send(200, "application/json", data);
+}
+
+void handleGraphData() {
+  String data = "{";
+  data += "\"tempHistory\":[";
+  for(int i=0; i<historySize; i++) {
+    data += String(tempHistory[(historyIndex + i) % historySize], 1);
+    if(i < historySize-1) data += ",";
+  }
+  data += "],\"touchHistory\":[";
+  for(int i=0; i<historySize; i++) {
+    data += touchHistory[(historyIndex + i) % historySize] ? "true" : "false";
+    if(i < historySize-1) data += ",";
+  }
+  data += "]}";
+  
+  server.send(200, "application/json", data);
+}
